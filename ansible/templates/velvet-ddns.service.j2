@@ -1,0 +1,13 @@
+# Géré par Velvet Relay (gateway/ansible). Lancé par velvet-ddns.timer.
+[Unit]
+Description=Velvet Relay : mise à jour du nom {{ ddns_record }} chez Cloudflare
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/velvet/velvet_ddns.py --record {{ ddns_record }} --zone {{ ddns_zone }} --token-file {{ ddns_token_path }} --ttl {{ ddns_ttl }}{{ '' if ddns_ipv4 else ' --no-ipv4' }}{{ '' if ddns_ipv6 else ' --no-ipv6' }}
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true

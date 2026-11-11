@@ -1,0 +1,55 @@
+# Ce fichier est un exemple. Copier vers all.yml (ignoré par Git) avant de le remplir.
+wireguard_interface: wg0
+wireguard_listen_port: 51820
+wireguard_gateway_address: 10.66.0.1/24
+
+# Appareils du PREMIER déploiement, chacun avec sa clé PUBLIQUE (Velvet Relay
+# › VPN › Passerelle › « Copier la clé publique ») et une adresse /32 distincte.
+# Ils amorcent le registre /var/lib/velvet-exit/devices.json ; ensuite, les
+# appareils s'ajoutent depuis l'app (VPN › Appareils) ou avec `velvet-device`,
+# et un redéploiement ne touche plus au registre.
+#
+# Adresse publique donnée dans les codes d'invitation. Par défaut l'IPv6 du
+# Raspberry ; le nom ddns_cloudflare_record (ci-dessous) s'il est réglé.
+# gateway_endpoint: "maison.example.net:51820"
+#
+# Nom DNS dynamique chez Cloudflare, pour joindre la passerelle aussi depuis
+# les réseaux sans IPv6 : toutes les 5 min, A = IPv4 publique de la box et
+# AAAA = IPv6 du Raspberry, en « DNS only ». Il faut AUSSI rediriger UDP 51820
+# vers le Raspberry sur la box (bail DHCP fixe), sinon l'IPv4 ne mène nulle part.
+# Jeton : Cloudflare › My Profile › API Tokens › modèle « Edit zone DNS »,
+# limité à la seule zone. Vide = désactivé.
+# ddns_cloudflare_record: "vpn.example.net"
+# ddns_cloudflare_token: "…"
+# ddns_cloudflare_zone: "example.net"   # déduit du nom si absent
+wireguard_clients:
+  - name: iPhone
+    public_key: "REMPLACER_PAR_LA_CLE_PUBLIQUE_DE_L_IPHONE"
+    address: 10.66.0.2/32
+  - name: Mac
+    public_key: "REMPLACER_PAR_LA_CLE_PUBLIQUE_DU_MAC"
+    address: 10.66.0.3/32
+
+# IPv6 entrant depuis Internet : seuls ces ports TCP passent (plus WireGuard
+# et l'ICMPv6). Le réseau local n'est pas filtré.
+#   22 : SSH (à n'ouvrir qu'avec la connexion par clé, voir ci-dessous)
+#   80 : nginx (Home Assistant et les autres sites depuis l'extérieur)
+internet_ipv6_tcp_ports: [22, 80]
+
+# Préfixe IPv6 du réseau local, jamais filtré. Vide = déduit de l'adresse IPv6
+# principale du Raspberry (/64).
+lan_ipv6_prefix: ""
+
+# Connexion SSH par clé uniquement (plus de mot de passe, root par clé).
+# À n'activer qu'APRÈS avoir vérifié que ta clé fonctionne, sinon tu perds
+# l'accès au Raspberry.
+ssh_disable_password_auth: false
+
+tor_trans_port: 9040
+tor_dns_port: 9053
+# Ports locaux de Tor (127.0.0.1), utilisés par l'API.
+tor_socks_port: 9050
+tor_control_port: 9051
+
+# API du pays de sortie, joignable seulement dans le tunnel.
+velvet_api_port: 8080

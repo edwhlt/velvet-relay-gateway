@@ -1,0 +1,24 @@
+[Unit]
+Description=Velvet Relay - Tor de la passerelle (conteneur Docker)
+# TransPort et DNSPort sont liés à l'adresse du tunnel : WireGuard d'abord.
+After=docker.service wg-quick@{{ wireguard_interface }}.service
+Requires=docker.service
+BindsTo=wg-quick@{{ wireguard_interface }}.service
+
+[Service]
+ExecStartPre=-/usr/bin/docker rm --force velvet-tor
+# La sortie de Tor arrive dans le journal (journalctl -u velvet-tor). Docker
+# en garde aussi une copie : plafonnée à 2 × 10 Mo pour ne jamais remplir le
+# disque si Tor boucle sur une erreur.
+ExecStart=/usr/bin/docker run --rm --name velvet-tor \
+    --network host \
+    --log-opt max-size=10m --log-opt max-file=2 \
+    --volume /etc/velvet/torrc:/etc/tor/torrc:ro \
+    --volume velvet-tor-data:/var/lib/tor \
+    velvet-tor:latest
+ExecStop=/usr/bin/docker stop velvet-tor
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

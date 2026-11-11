@@ -1,0 +1,17 @@
+[Unit]
+Description=Velvet Relay - pare-feu (tables velvet_*, sans toucher aux autres)
+# Avant WireGuard : le tunnel ne doit jamais exister sans ses règles.
+Before=wg-quick@{{ wireguard_interface }}.service
+Wants=network-pre.target
+After=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+ExecStart=/usr/sbin/nft -f /etc/velvet/firewall.nft
+ExecReload=/usr/sbin/nft -f /etc/velvet/firewall.nft
+ExecStop=/usr/sbin/nft delete table inet velvet_filter
+ExecStop=/usr/sbin/nft delete table ip velvet_nat
+
+[Install]
+WantedBy=multi-user.target

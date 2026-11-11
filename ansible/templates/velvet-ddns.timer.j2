@@ -1,0 +1,11 @@
+# Géré par Velvet Relay (gateway/ansible).
+[Unit]
+Description=Velvet Relay : mise à jour DNS toutes les 5 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,79 @@
+#!/usr/sbin/nft -f
+# Pare-feu Velvet Relay (velvet-firewall.service).
+#
+# Le Raspberry fait aussi tourner d'autres services (Docker, Home Assistant…) :
+# on ne vide JAMAIS le jeu de règles. Ces tables sont propres à Velvet Relay et
+# coexistent avec celles de Docker. Elles ne filtrent que :
+#   - le trafic venant du tunnel WireGuard (Tor uniquement, rien en direct) ;
+#   - l'IPv6 entrant depuis Internet (seuls les ports listés passent).
+# Le réseau local (IPv4 et IPv6) n'est pas filtré.
+{% set gateway_ip = wireguard_gateway_address.split('/')[0] %}
+
+# Recharge idempotente : on recrée nos tables, sans toucher aux autres.
+table inet velvet_filter
+delete table inet velvet_filter
+table ip velvet_nat
+delete table ip velvet_nat
+
+table inet velvet_filter {
+    chain input {
+        type filter hook input priority filter; policy accept;
+
+        iifname "lo" accept
+        # Diagnostic (velvet-diag) : des paquets arrivent-ils sur le port
+        # WireGuard ? Aucun = port injoignable ; des paquets sans handshake =
+        # mauvaise clé. Compte seulement, n'enregistre rien.
+        udp dport {{ wireguard_listen_port }} counter comment "wireguard-entrant"
+        ct state established,related accept
+        iifname "{{ wireguard_interface }}" jump from_tunnel
+        meta nfproto ipv6 jump from_ipv6
+    }
+
+    # Clients VPN : seulement les ports de Tor et l'API du pays de sortie.
+    # Après redirection NAT, le TCP arrive sur TransPort et le DNS sur DNSPort.
+    chain from_tunnel {
+        tcp dport {{ tor_trans_port }} accept
+        udp dport {{ tor_dns_port }} accept
+        ip daddr {{ gateway_ip }} tcp dport {{ velvet_api_port }} accept
+        counter drop comment "tunnel-bloque"
+    }
+
+    # IPv6 entrant. En IPv6, la box ne fait pas de NAT : sans ce filtre, tous
+    # les services du Raspberry seraient joignables depuis Internet.
+    chain from_ipv6 {
+        ip6 saddr { fe80::/10, {{ lan_prefix | trim }} } accept
+        # ICMPv6 (découverte de voisins, MTU…) : indispensable à l'IPv6. En
+        # numéro (58) : nftables 0.9.8 ne résout le nom que via /etc/protocols.
+        meta l4proto 58 accept
+        udp dport {{ wireguard_listen_port }} accept
+{% if internet_ipv6_tcp_ports %}
+        tcp dport { {{ internet_ipv6_tcp_ports | join(', ') }} } accept
+{% endif %}
+        counter drop comment "ipv6-internet-bloque"
+    }
+
+    # Rien de ce qui vient du tunnel n'est routé : tout passe par Tor ou rien.
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+
+        iifname "{{ wireguard_interface }}" counter drop comment "routage-tunnel-bloque"
+        oifname "{{ wireguard_interface }}" counter drop comment "routage-tunnel-bloque"
+    }
+}
+
+table ip velvet_nat {
+    chain prerouting {
+        # Avant les règles NAT de Docker.
+        type nat hook prerouting priority -110; policy accept;
+
+        # L'API reste locale : elle ne doit pas partir dans Tor.
+        iifname "{{ wireguard_interface }}" ip daddr {{ gateway_ip }} tcp dport {{ velvet_api_port }} return
+
+        # Tout le TCP du tunnel part dans Tor.
+        iifname "{{ wireguard_interface }}" ip protocol tcp redirect to :{{ tor_trans_port }}
+
+        # DNSPort ne prend que l'UDP. Le DNS en TCP passe par TransPort et reste
+        # dans Tor ; le reste de l'UDP est rejeté par from_tunnel.
+        iifname "{{ wireguard_interface }}" udp dport 53 redirect to :{{ tor_dns_port }}
+    }
+}

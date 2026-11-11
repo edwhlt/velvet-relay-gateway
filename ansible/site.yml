@@ -1,0 +1,445 @@
+---
+# Passerelle Velvet Relay sur un Raspberry partagé (Docker, Home Assistant…).
+# Ne vide jamais le pare-feu et ne touche ni à Docker ni aux autres services.
+- name: Configure the Velvet Relay WireGuard-to-Tor gateway
+  hosts: torvpn_gateways
+  become: true
+  vars:
+    wireguard_private_key_path: "/etc/wireguard/{{ wireguard_interface }}.key"
+    tor_control_password_path: /etc/velvet/tor-control.pass
+    tor_control_hash_path: /etc/velvet/tor-control.hash
+    lan_prefix: >-
+      {{ lan_ipv6_prefix if lan_ipv6_prefix
+         else ((ansible_default_ipv6.address ~ '/64') | ansible.utils.ipaddr('network/prefix')) }}
+    ssh_client_address: "{{ (ansible_env.SSH_CLIENT | default('')).split(' ')[0] }}"
+    # Adresse publique donnée aux nouveaux appareils dans leur code
+    # d'invitation. `gateway_endpoint` (all.yml) la remplace, par ex. un nom DynDNS.
+    velvet_public_endpoint: >-
+      {{ gateway_endpoint | default((ddns_record ~ ':' ~ wireguard_listen_port) if ddns_enabled
+         else ('[' ~ ansible_default_ipv6.address ~ ']:' ~ wireguard_listen_port)) }}
+    # Nom DNS dynamique chez Cloudflare (A = IPv4 de la box, AAAA = IPv6 du
+    # Raspberry). Désactivé tant que ddns_record est vide.
+    ddns_record: "{{ ddns_cloudflare_record | default('') }}"
+    ddns_enabled: "{{ ddns_record | length > 0 }}"
+    ddns_zone: >-
+      {{ ddns_cloudflare_zone | default(ddns_record.split('.')[-2:] | join('.'), true) }}
+    ddns_token_path: /etc/velvet/cloudflare.token
+    ddns_ttl: "{{ ddns_cloudflare_ttl | default(60) }}"
+    ddns_ipv4: "{{ ddns_update_ipv4 | default(true) | bool }}"
+    ddns_ipv6: "{{ ddns_update_ipv6 | default(true) | bool }}"
+    devices_registry_path: /var/lib/velvet-exit/devices.json
+    # Appareils du PREMIER déploiement : ils amorcent le registre, qui fait foi
+    # ensuite (VPN › Appareils dans l'app, ou `velvet-device`). L'ancien format
+    # à un seul client (wireguard_client_public_key) reste accepté.
+    wireguard_peers: >-
+      {{ wireguard_clients if wireguard_clients is defined
+         else [{'name': 'iPhone',
+                'public_key': wireguard_client_public_key | default(''),
+                'address': wireguard_client_address | default('10.66.0.2/32')}] }}
+
+  pre_tasks:
+    - name: Refuse placeholder or missing settings
+      ansible.builtin.assert:
+        that:
+          - wireguard_peers | length > 0
+          - wireguard_peers | map(attribute='public_key') | select('match', '^[A-Za-z0-9+/]{43}=$') | list | length == wireguard_peers | length
+          # Une même adresse pour deux appareils casserait le routage du tunnel.
+          - wireguard_peers | map(attribute='address') | unique | list | length == wireguard_peers | length
+          - wireguard_peers | map(attribute='public_key') | unique | list | length == wireguard_peers | length
+          - ansible_default_ipv6.address is defined or lan_ipv6_prefix
+          # Un préfixe vide bloquerait l'IPv6 du réseau local (Home Assistant…).
+          - "'/' in lan_prefix and (lan_prefix | trim) is ansible.utils.ipv6"
+        fail_msg: >-
+          Copy group_vars/all.example.yml to group_vars/all.yml and list each device in
+          wireguard_clients : clé publique WireGuard valide (Velvet Relay › VPN ›
+          Passerelle) et adresse /32 distincte.
+
+    - name: Refuse an incomplete dynamic DNS setup
+      when: ddns_enabled | bool
+      ansible.builtin.assert:
+        that:
+          - ddns_record is match('^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$')
+          - ddns_record == ddns_zone or ddns_record.endswith('.' ~ ddns_zone)
+          - (ddns_cloudflare_token | default('')) | length > 20
+        fail_msg: >-
+          ddns_cloudflare_record ({{ ddns_record }}) demande ddns_cloudflare_token
+          (jeton Cloudflare « Edit zone DNS » limité à la zone {{ ddns_zone }})
+          et un nom dans cette zone (sinon régler ddns_cloudflare_zone).
+
+    - name: Check that Docker is available (Tor runs in a container)
+      ansible.builtin.command:
+        cmd: docker version --format '{{ '{{' }}.Server.Version{{ '}}' }}'
+      changed_when: false
+      check_mode: false
+
+    # Le filtre IPv6 bloque l'Internet sauf internet_ipv6_tcp_ports : une
+    # session SSH venue d'Internet sans le port 22 serait coupée.
+    - name: Refuse a firewall that would lock out the current SSH session
+      ansible.builtin.assert:
+        that:
+          - >-
+            ssh_client_address == ''
+            or ':' not in ssh_client_address
+            or ssh_client_address is ansible.utils.in_network(lan_prefix)
+            or ssh_client_address is ansible.utils.in_network('fe80::/10')
+            or 22 in internet_ipv6_tcp_ports
+        fail_msg: >-
+          La session SSH vient d'Internet en IPv6 ({{ ssh_client_address }}) mais le
+          port 22 n'est pas dans internet_ipv6_tcp_ports : le pare-feu la couperait.
+
+    - name: Show the networks the firewall will treat as local
+      ansible.builtin.debug:
+        msg: "Réseau local IPv6 non filtré : {{ lan_prefix }} ; ports ouverts depuis Internet (IPv6) : {{ internet_ipv6_tcp_ports }} + UDP {{ wireguard_listen_port }}"
+
+  tasks:
+    # Pas d'apt update : un dépôt tiers mort ferait échouer tout le déploiement,
+    # et wireguard-tools est déjà dans le cache des dépôts Debian.
+    - name: Install gateway packages
+      ansible.builtin.apt:
+        name:
+          - wireguard-tools
+          - nftables
+          - curl
+          - python3
+          - openssl
+        state: present
+
+    - name: Create the exit API system user
+      ansible.builtin.user:
+        name: velvet-exit
+        system: true
+        shell: /usr/sbin/nologin
+        create_home: false
+
+    - name: Create the Velvet Relay configuration directory
+      ansible.builtin.file:
+        path: /etc/velvet
+        state: directory
+        owner: root
+        group: velvet-exit
+        mode: '0750'
+
+    - name: Create the Tor image and exit API directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      loop:
+        - /etc/velvet/tor-image
+        - /usr/local/lib/velvet
+
+    # Secrets créés sur le Raspberry, jamais dans les variables ni dans --diff.
+    - name: Generate the gateway WireGuard private key once
+      ansible.builtin.shell:
+        cmd: umask 077 && wg genkey > {{ wireguard_private_key_path }}
+        creates: "{{ wireguard_private_key_path }}"
+      notify: Restart gateway services
+
+    # À blanc avant le premier déploiement, la clé n'existe pas : sortie vide.
+    - name: Derive the gateway WireGuard public key
+      ansible.builtin.shell:
+        cmd: wg pubkey < {{ wireguard_private_key_path }}
+      register: gateway_public_key
+      changed_when: false
+      failed_when: gateway_public_key.rc != 0 and not ansible_check_mode
+      check_mode: false
+
+    - name: Generate the Tor control password once
+      ansible.builtin.shell:
+        cmd: umask 027 && openssl rand -hex 32 > {{ tor_control_password_path }}
+        creates: "{{ tor_control_password_path }}"
+
+    - name: Restrict the Tor control password to the exit API
+      # À blanc, le fichier n'a pas été créé.
+      when: not ansible_check_mode
+      ansible.builtin.file:
+        path: "{{ tor_control_password_path }}"
+        owner: root
+        group: velvet-exit
+        mode: '0640'
+
+    - name: Copy the Tor image definition
+      ansible.builtin.copy:
+        src: files/tor-image/Dockerfile
+        dest: /etc/velvet/tor-image/Dockerfile
+        owner: root
+        group: root
+        mode: '0644'
+      register: tor_image_definition
+
+    - name: Look for an existing Tor image
+      ansible.builtin.command:
+        cmd: docker image inspect velvet-tor:latest
+      register: tor_image_present
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Build the Tor image (Debian 13, current Tor and GeoIP)
+      ansible.builtin.command:
+        cmd: docker build --pull --tag velvet-tor:latest /etc/velvet/tor-image
+      when: tor_image_definition.changed or tor_image_present.rc != 0
+      notify: Restart gateway services
+
+    - name: Hash the Tor control password once
+      ansible.builtin.shell:
+        cmd: >-
+          umask 077 &&
+          docker run --rm --entrypoint tor velvet-tor:latest --quiet
+          --hash-password "$(cat {{ tor_control_password_path }})"
+          | grep '^16:' | tail -n 1 > {{ tor_control_hash_path }}
+          && test -s {{ tor_control_hash_path }}
+        creates: "{{ tor_control_hash_path }}"
+
+    # Absent lors d'un passage à blanc avant le premier déploiement.
+    - name: Read the Tor control password hash
+      ansible.builtin.slurp:
+        src: "{{ tor_control_hash_path }}"
+      register: tor_control_hash
+      failed_when: tor_control_hash is failed and not ansible_check_mode
+
+    - name: Write the Tor configuration
+      ansible.builtin.template:
+        src: templates/torrc.j2
+        dest: /etc/velvet/torrc
+        owner: root
+        group: root
+        mode: '0644'
+      vars:
+        tor_control_password_hash: >-
+          {{ (tor_control_hash.content | b64decode | trim) if tor_control_hash.content is defined
+             else '16:GENERE-AU-DEPLOIEMENT' }}
+      notify: Restart gateway services
+
+    - name: Write the WireGuard gateway configuration
+      ansible.builtin.template:
+        src: templates/wg0.conf.j2
+        dest: "/etc/wireguard/{{ wireguard_interface }}.conf"
+        owner: root
+        group: root
+        mode: '0600'
+      notify: Restart gateway services
+
+    - name: Install the exit API
+      ansible.builtin.copy:
+        src: files/velvet_exit_api.py
+        dest: /usr/local/lib/velvet/velvet_exit_api.py
+        owner: root
+        group: root
+        mode: '0755'
+      notify: Restart gateway services
+
+    - name: Create the gateway state directory
+      ansible.builtin.file:
+        path: /var/lib/velvet-exit
+        state: directory
+        owner: velvet-exit
+        group: velvet-exit
+        mode: '0750'
+
+    # Une seule fois : ensuite le registre évolue depuis l'app et ne doit
+    # jamais être écrasé par un redéploiement.
+    - name: Seed the device registry from wireguard_clients
+      ansible.builtin.copy:
+        dest: "{{ devices_registry_path }}"
+        force: false
+        owner: velvet-exit
+        group: velvet-exit
+        mode: '0640'
+        content: |
+          {"devices": [{% for peer in wireguard_peers %}
+            {"name": {{ peer.name | to_json }}, "publicKey": {{ peer.public_key | to_json }}, "address": {{ peer.address | to_json }}}{{ "," if not loop.last else "" }}{% endfor %}
+          ]}
+      notify: Restart gateway services
+
+    - name: Install the velvet-device command
+      ansible.builtin.template:
+        src: templates/velvet-device.j2
+        dest: /usr/local/sbin/velvet-device
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Install the velvet-diag command
+      ansible.builtin.template:
+        src: templates/velvet-diag.j2
+        dest: /usr/local/sbin/velvet-diag
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Install the Velvet Relay systemd units
+      ansible.builtin.template:
+        src: "templates/{{ item }}.j2"
+        dest: "/etc/systemd/system/{{ item }}"
+        owner: root
+        group: root
+        mode: '0644'
+      loop:
+        - velvet-firewall.service
+        - velvet-tor.service
+        - velvet-exit-api.service
+      notify: Restart gateway services
+
+    - name: Write and validate the Velvet Relay firewall
+      ansible.builtin.template:
+        src: templates/velvet-firewall.nft.j2
+        dest: /etc/velvet/firewall.nft
+        owner: root
+        group: root
+        mode: '0644'
+        validate: /usr/sbin/nft -c -f %s
+      register: firewall_rules
+
+    # Filet de sécurité : si les nouvelles règles coupent l'accès, elles sont
+    # retirées d'elles-mêmes au bout de 3 minutes (retour à l'état d'avant).
+    - name: Apply the firewall with an automatic rollback
+      when: firewall_rules.changed and not ansible_check_mode
+      block:
+        - name: Arm the firewall rollback (3 minutes)
+          ansible.builtin.command:
+            cmd: >-
+              systemd-run --unit=velvet-firewall-rollback --on-active=180
+              /bin/systemctl stop velvet-firewall.service
+          changed_when: true
+
+        - name: Load the Velvet Relay firewall
+          ansible.builtin.systemd_service:
+            name: velvet-firewall
+            state: restarted
+            enabled: true
+            daemon_reload: true
+
+        - name: Check that Ansible can still connect
+          ansible.builtin.wait_for_connection:
+            timeout: 60
+
+        - name: Disarm the firewall rollback
+          ansible.builtin.command:
+            cmd: systemctl stop velvet-firewall-rollback.timer
+          changed_when: true
+
+    - name: Disable SSH password authentication
+      when: ssh_disable_password_auth | bool
+      block:
+        - name: Write the SSH hardening drop-in
+          ansible.builtin.copy:
+            dest: /etc/ssh/sshd_config.d/10-velvet-relay.conf
+            owner: root
+            group: root
+            mode: '0644'
+            content: |
+              # Géré par Velvet Relay (gateway/ansible). Lu avant les autres
+              # fichiers du dossier : ces valeurs l'emportent.
+              PasswordAuthentication no
+              KbdInteractiveAuthentication no
+              PermitRootLogin prohibit-password
+          notify: Reload SSH
+
+        - name: Check the SSH server configuration before reloading it
+          ansible.builtin.command:
+            cmd: /usr/sbin/sshd -t
+          changed_when: false
+
+    - name: Keep the gateway name up to date at Cloudflare
+      when: ddns_enabled | bool
+      block:
+        - name: Store the Cloudflare API token
+          ansible.builtin.copy:
+            dest: "{{ ddns_token_path }}"
+            content: "{{ ddns_cloudflare_token }}\n"
+            owner: root
+            group: root
+            mode: '0600'
+          no_log: true
+
+        - name: Install the dynamic DNS updater
+          ansible.builtin.copy:
+            src: files/velvet_ddns.py
+            dest: /usr/local/lib/velvet/velvet_ddns.py
+            owner: root
+            group: root
+            mode: '0755'
+
+        - name: Install the dynamic DNS units
+          ansible.builtin.template:
+            src: "templates/{{ item }}.j2"
+            dest: "/etc/systemd/system/{{ item }}"
+            owner: root
+            group: root
+            mode: '0644'
+          loop:
+            - velvet-ddns.service
+            - velvet-ddns.timer
+
+        - name: Enable the dynamic DNS timer
+          when: not ansible_check_mode
+          ansible.builtin.systemd_service:
+            name: velvet-ddns.timer
+            enabled: true
+            state: started
+            daemon_reload: true
+
+        # Première mise à jour tout de suite : une erreur (jeton, zone) se voit ici.
+        - name: Update the DNS records now
+          when: not ansible_check_mode
+          ansible.builtin.systemd_service:
+            name: velvet-ddns.service
+            state: started
+
+    - name: Enable gateway services
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+      loop:
+        - velvet-firewall
+        - "wg-quick@{{ wireguard_interface }}"
+        - velvet-tor
+        - velvet-exit-api
+      # À blanc, les unités n'existent pas encore.
+      when: not ansible_check_mode
+
+  handlers:
+    # Tor et l'API sont liés à wg0 (BindsTo) : on relance les trois, dans l'ordre.
+    - name: Restart gateway services
+      # À blanc, les unités n'existent pas encore.
+      when: not ansible_check_mode
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        state: restarted
+        daemon_reload: true
+      loop:
+        - "wg-quick@{{ wireguard_interface }}"
+        - velvet-tor
+        - velvet-exit-api
+
+    - name: Reload SSH
+      ansible.builtin.systemd_service:
+        name: ssh
+        state: reloaded
+
+  post_tasks:
+    - name: Wait for Tor to reach the network
+      when: not ansible_check_mode
+      ansible.builtin.command:
+        cmd: curl --silent --fail --max-time 30 --socks5-hostname 127.0.0.1:{{ tor_socks_port }} https://check.torproject.org/api/ip
+      register: tor_check
+      until: tor_check.rc == 0 and (tor_check.stdout | from_json).IsTor
+      retries: 20
+      delay: 6
+      changed_when: false
+
+    - name: Show what to enter in Velvet Relay (VPN › Passerelle)
+      when: not ansible_check_mode
+      ansible.builtin.debug:
+        msg:
+          - "Clé publique du Raspberry : {{ gateway_public_key.stdout }}"
+          - "Adresse (IPv6, sans réglage de box) : [{{ ansible_default_ipv6.address }}]:{{ wireguard_listen_port }}"
+          - "Sortie Tor vérifiée : {{ (tor_check.stdout | from_json).IP }}"
+          - "Adresse des invitations : {{ velvet_public_endpoint }}"
+          - "IPv4 (réseaux sans IPv6) : rediriger UDP {{ wireguard_listen_port }} vers ce Raspberry sur la box."
+          - "Diagnostic sur le Raspberry : velvet-diag"

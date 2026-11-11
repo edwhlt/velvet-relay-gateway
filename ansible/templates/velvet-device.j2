@@ -1,0 +1,60 @@
+#!/bin/bash
+# velvet-device : gérer les appareils autorisés dans le tunnel, depuis le
+# Raspberry (même API que l'écran VPN › Appareils de l'app).
+#
+#   velvet-device list
+#   velvet-device add NOM CLÉ_PUBLIQUE      → affiche le code d'invitation
+#   velvet-device invite CLÉ_PUBLIQUE       → réaffiche le code d'invitation
+#   velvet-device remove CLÉ_PUBLIQUE
+{% set gateway_ip = wireguard_gateway_address.split('/')[0] %}
+set -euo pipefail
+
+API="http://{{ gateway_ip }}:{{ velvet_api_port }}"
+
+call() {
+    local method=$1 path=$2 body=${3:-}
+    if [ -n "$body" ]; then
+        curl -s --max-time 20 -X "$method" -H 'Content-Type: application/json' -d "$body" "$API$path"
+    else
+        curl -s --max-time 20 "$API$path"
+    fi
+}
+
+json() { python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$1"; }
+
+show() {
+    python3 -c '
+import datetime, json, sys
+data = json.load(sys.stdin)
+if "error" in data:
+    sys.exit("erreur : " + data["error"])
+for device in data.get("devices", []):
+    seen = device.get("lastHandshake")
+    seen = datetime.datetime.fromtimestamp(seen).strftime("%d/%m %H:%M") if seen else "jamais"
+    print("{:<20} {:<16} {}  dernier échange : {}".format(device["name"], device["address"], device["publicKey"], seen))
+invitation = data.get("invitation")
+if invitation:
+    from urllib.parse import quote, urlencode
+    # La clé contient + / = et l\x27adresse IPv6 des crochets : tout est encodé,
+    # les espaces en %20 (les apps Apple ne lisent pas « + » comme une espace).
+    url = "velvetrelay://join?" + urlencode([
+        ("endpoint", invitation["endpoint"]), ("key", invitation["gatewayPublicKey"]),
+        ("address", invitation["address"]), ("name", invitation["name"])], quote_via=quote)
+    print("Code d\x27invitation à coller dans l\x27app (VPN › Passerelle) :")
+    print(url)
+'
+}
+
+case "${1:-list}" in
+    list) call GET /devices | show ;;
+    add)
+        [ $# -eq 3 ] || { echo "usage : velvet-device add NOM CLÉ_PUBLIQUE" >&2; exit 2; }
+        call POST /devices "{\"name\": $(json "$2"), \"publicKey\": $(json "$3")}" | show ;;
+    invite)
+        [ $# -eq 2 ] || { echo "usage : velvet-device invite CLÉ_PUBLIQUE" >&2; exit 2; }
+        call POST /devices/invitation "{\"publicKey\": $(json "$2")}" | show ;;
+    remove)
+        [ $# -eq 2 ] || { echo "usage : velvet-device remove CLÉ_PUBLIQUE" >&2; exit 2; }
+        call POST /devices/remove "{\"publicKey\": $(json "$2")}" | show ;;
+    *) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

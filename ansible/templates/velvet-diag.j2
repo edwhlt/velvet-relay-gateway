@@ -1,0 +1,66 @@
+#!/bin/bash
+# velvet-diag : état de la passerelle Velvet Relay en un seul coup d'œil.
+# Lecture seule. Ni secret ni adresse IP de client : la sortie peut être
+# copiée telle quelle pour demander de l'aide.
+{% set gateway_ip = wireguard_gateway_address.split('/')[0] %}
+set -u
+
+section() { printf '\n== %s\n' "$1"; }
+
+section "Services"
+for unit in velvet-firewall wg-quick@{{ wireguard_interface }} velvet-tor velvet-exit-api docker; do
+    printf '  %-20s %s\n' "$unit" "$(systemctl is-active "$unit")"
+done
+if systemctl is-active --quiet velvet-firewall-rollback.timer; then
+    echo "  ⚠ retour arrière du pare-feu armé (déploiement en cours ou interrompu)"
+fi
+
+section "WireGuard ({{ wireguard_interface }})"
+now=$(date +%s)
+wg show {{ wireguard_interface }} dump 2>/dev/null | tail -n +2 | while IFS=$'\t' read -r key _ _ _ handshake rx tx _; do
+    if [ "$handshake" = "0" ]; then
+        age="jamais"
+    else
+        age="il y a $(( now - handshake )) s"
+    fi
+    printf '  pair %s…  dernier handshake : %s  reçu : %s o  envoyé : %s o\n' "${key:0:8}" "$age" "$rx" "$tx"
+done
+echo "  (handshake de plus de 180 s = pair déconnecté ; WireGuard renégocie toutes les 2 min)"
+
+section "Compteurs du pare-feu (paquets depuis le dernier chargement)"
+nft list table inet velvet_filter 2>/dev/null \
+    | sed -n 's/.*counter packets \([0-9]*\) bytes [0-9]*.*comment "\([^"]*\)".*/\2 \1/p' \
+    | awk '{ total[$1] += $2 } END { for (c in total) printf "  %-24s %s\n", c, total[c] }' | sort
+cat <<'EOF'
+  wireguard-entrant : 0 alors que l'iPhone tente de se connecter = port
+                      injoignable (box, adresse) ; > 0 sans handshake = clé.
+EOF
+
+section "Tor (conteneur velvet-tor)"
+docker ps --filter name=^velvet-tor$ --format '{{ '{{' }}.Status{{ '}}' }}  image {{ '{{' }}.Image{{ '}}' }}' | sed 's/^/  /'
+journalctl -u velvet-tor --no-pager -o cat -n 200 2>/dev/null | grep -E 'Bootstrapped' | tail -n 1 | sed 's/^/  /'
+
+section "Sortie Tor vérifiée (API du pays)"
+curl -s --max-time 90 http://{{ gateway_ip }}:{{ velvet_api_port }}/status | sed 's/^/  /' || echo "  API injoignable"
+echo
+
+{% if ddns_enabled | bool %}
+section "Nom public ({{ ddns_record }})"
+echo "  A    : $(getent ahostsv4 {{ ddns_record }} 2>/dev/null | awk 'NR==1 {print $1}') (IPv4 de la box)"
+echo "  AAAA : $(getent ahostsv6 {{ ddns_record }} 2>/dev/null | awk 'NR==1 {print $1}') (IPv6 du Raspberry)"
+echo "  dernière mise à jour : $(systemctl show velvet-ddns.service -p Result --value) ($(journalctl -u velvet-ddns --no-pager -o cat -n 1 2>/dev/null | tail -n 1))"
+echo "  (l'IPv4 ne marche qu'avec la redirection UDP {{ wireguard_listen_port }} vers ce Raspberry sur la box)"
+
+{% endif %}
+section "Avertissements et erreurs (24 h)"
+journalctl -p warning --since "24 hours ago" --no-pager -o short \
+    -u velvet-tor -u velvet-exit-api -u wg-quick@{{ wireguard_interface }} -u velvet-firewall{{ ' -u velvet-ddns' if ddns_enabled | bool else '' }} 2>/dev/null \
+    | grep -v '^-- ' | tail -n 15 | sed 's/^/  /'
+[ "${PIPESTATUS[0]}" = "0" ] || echo "  (journal illisible)"
+
+section "Espace disque"
+# « Archived and active journals take up 4.0G in the file system. »
+echo "  journal système : $(journalctl --disk-usage 2>/dev/null | sed -n 's/.*take up \([^ ]*\) .*/\1/p')"
+log=$(docker inspect --format '{{ '{{' }}.LogPath{{ '}}' }}' velvet-tor 2>/dev/null)
+[ -n "$log" ] && echo "  logs Docker de Tor : $(du -h "$log" 2>/dev/null | cut -f1) (plafond 2 × 10 Mo)"
+echo "  disque / : $(df -h / | awk 'NR==2 {print $4 " libres sur " $2}')"

@@ -1,0 +1,12 @@
+[Interface]
+Address = {{ wireguard_gateway_address }}
+ListenPort = {{ wireguard_listen_port }}
+MTU = 1280
+SaveConfig = false
+# Clé privée lue sur le disque du Raspberry : elle n'apparaît ni dans ce
+# modèle ni dans la sortie d'Ansible.
+PostUp = wg set %i private-key /etc/wireguard/{{ wireguard_interface }}.key
+
+# Pas de [Peer] ici : les appareils sont dans le registre
+# /var/lib/velvet-exit/devices.json, chargé par velvet-exit-api au démarrage,
+# et se gèrent depuis l'app (VPN › Appareils) ou avec `velvet-device`.

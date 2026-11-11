@@ -1,0 +1,9 @@
+.DS_Store
+__pycache__/
+*.retry
+
+# Your real configuration: never commit it, not even encrypted.
+ansible/inventory.ini
+ansible/group_vars/all.yml
+ansible/client.conf
+*.vault

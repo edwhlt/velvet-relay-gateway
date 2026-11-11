@@ -1,0 +1,24 @@
+# Client Tor privé pour la passerelle Velvet Relay (conteneur velvet-tor).
+# Ce serveur n'est pas un relai Tor.
+ClientOnly 1
+ExitRelay 0
+RunAsDaemon 0
+User debian-tor
+DataDirectory /var/lib/tor
+
+{% set gateway_ip = wireguard_gateway_address.split('/')[0] %}
+# Ports liés à l'adresse du tunnel uniquement : le réseau local ne peut pas
+# s'en servir. nftables y redirige le TCP et le DNS des clients WireGuard.
+TransPort {{ gateway_ip }}:{{ tor_trans_port }}
+DNSPort {{ gateway_ip }}:{{ tor_dns_port }}
+AutomapHostsOnResolve 1
+VirtualAddrNetworkIPv4 10.192.0.0/10
+
+# Local uniquement : l'API vérifie la sortie (SOCKS) et règle le pays (contrôle).
+SocksPort 127.0.0.1:{{ tor_socks_port }}
+ControlPort 127.0.0.1:{{ tor_control_port }}
+HashedControlPassword {{ tor_control_password_hash }}
+
+# Pays de sortie : réglé à chaud par velvet-exit-api, jamais écrit ici.
+
+Log notice stdout

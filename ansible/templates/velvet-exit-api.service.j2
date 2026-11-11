@@ -1,0 +1,49 @@
+[Unit]
+Description=Velvet Relay - API de la passerelle : pays de sortie Tor et appareils (tunnel WireGuard uniquement)
+# L'API écoute sur l'adresse du tunnel, pilote le Tor du conteneur et charge
+# les appareils du registre dans WireGuard.
+After=wg-quick@{{ wireguard_interface }}.service velvet-tor.service
+BindsTo=wg-quick@{{ wireguard_interface }}.service
+Wants=velvet-tor.service
+
+[Service]
+Type=simple
+User=velvet-exit
+Group=velvet-exit
+Environment=VELVET_API_ADDRESS={{ wireguard_gateway_address.split('/')[0] }}
+Environment=VELVET_API_PORT={{ velvet_api_port }}
+Environment=VELVET_TOR_SOCKS=127.0.0.1:{{ tor_socks_port }}
+Environment=VELVET_TOR_CONTROL=127.0.0.1:{{ tor_control_port }}
+Environment=VELVET_TOR_PASSWORD_FILE=/etc/velvet/tor-control.pass
+Environment=VELVET_STATE_FILE=/var/lib/velvet-exit/country
+Environment=VELVET_DEVICES_FILE=/var/lib/velvet-exit/devices.json
+Environment=VELVET_WG_BIN=/usr/bin/wg
+Environment=VELVET_WG_INTERFACE={{ wireguard_interface }}
+Environment=VELVET_TUNNEL_NETWORK={{ wireguard_gateway_address | ansible.utils.ipaddr('network/prefix') }}
+Environment=VELVET_PUBLIC_ENDPOINT={{ velvet_public_endpoint }}
+Environment=VELVET_GATEWAY_PUBLIC_KEY={{ gateway_public_key.stdout }}
+StateDirectory=velvet-exit
+ExecStart=/usr/bin/python3 /usr/local/lib/velvet/velvet_exit_api.py
+Restart=on-failure
+RestartSec=5
+
+# Ajouter ou retirer un appareil (wg set) demande CAP_NET_ADMIN, et rien d'autre.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+# AF_NETLINK : wg parle au module WireGuard du noyau.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
+# Relancer WireGuard (wg-quick) relance aussi l'API, qui y recharge les appareils.
+WantedBy=wg-quick@{{ wireguard_interface }}.service
